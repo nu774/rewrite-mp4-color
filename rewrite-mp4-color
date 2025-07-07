@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import struct
+import getopt
+import subprocess
+
+def get_header(fp):
+    header_size = 8
+    x = fp.read(8)
+    if not x or len(x) < 8:
+        return None, None
+    size, name = struct.unpack('>I4s', x)
+    if size == 1:
+        x = fp.read(8)
+        if not x or len(x) < 8:
+            return None, None
+        size = struct.unpack('>8', x)[0]
+        header_size = 16
+    return name, size - header_size
+
+def track_offsets(fp):
+    track_offsets = []
+    while True:
+        name, size = get_header(fp)
+        if not name: break
+        if name == b'moov':
+            continue
+        if name == b'trak':
+            track_offsets.append((fp.tell(), size))
+        fp.seek(size, os.SEEK_CUR)
+    return track_offsets
+
+def goto_box(fp, limit, path):
+    while fp.tell() < limit:
+        name, size = get_header(fp)
+        if name == path[0]:
+            if len(path) == 1:
+                return fp.tell(), size
+            return goto_box(fp, limit, path[1:])
+        fp.seek(size, os.SEEK_CUR)
+    return None, None
+
+def iter_nal_units_in_annexb(annexb_stream):
+    start_code = b'\x00\x00\x00\x01'
+    off = 0
+    while len(annexb_stream) - off > 4:
+        if annexb_stream[off:off+4] != start_code:
+            return
+        pos = annexb_stream.find(start_code, off + 4)
+        if pos < 0:
+            return annexb_stream[off:]
+        yield annexb_stream[off:pos]
+        off = pos
+
+def make_colr_box_payload(primaries, transfer, matrix):
+    colour_type = b'nclx'
+    colr_data = struct.pack('>4sHHHB', colour_type, primaries, transfer, matrix, 0)
+    return colr_data
+
+def goto_colr(fp, track_off, limit):
+    fp.seek(track_off)
+    off, size = goto_box(fp, limit, (b'mdia', b'minf', b'stbl', b'stsd'))
+    if not off:
+        return None, None
+    fp.seek(8, os.SEEK_CUR) # skip inside stsd
+    off, size = goto_box(fp, off + size, (b'hvc1',))
+    if not off:
+        return None, None
+    fp.seek(78, os.SEEK_CUR) # skip inside hvc1
+    return goto_box(fp, off + size, (b'colr',))
+
+def goto_hvcC(fp, track_off, limit):
+    fp.seek(track_off)
+    off, size = goto_box(fp, limit, (b'mdia', b'minf', b'stbl', b'stsd'))
+    if not off:
+        return None, None
+    fp.seek(8, os.SEEK_CUR) # skip inside stsd
+    off, size = goto_box(fp, off + size, (b'hvc1',))
+    if not off:
+        return None, None
+    fp.seek(78, os.SEEK_CUR) # skip inside hvc1
+    return goto_box(fp, off + size, (b'hvcC',))
+
+def extract_nal_units_from_hvcC(extradata):
+    offset = 23
+    while offset < len(extradata):
+        array_header = extradata[offset]
+        nal_type = array_header & 0x3F
+        offset += 1
+        num_nalus = struct.unpack(">H", extradata[offset:offset+2])[0]
+        offset += 2
+        for i in range(num_nalus):
+            nal_size = struct.unpack(">H", extradata[offset:offset+2])[0]
+            offset += 2
+            yield extradata[offset:offset+nal_size]
+            offset += nal_size
+
+def update_nal_units_in_hvcC(extradata, nal_units):
+    result = bytearray(extradata)
+    offset = 23
+    j = 0
+    while offset < len(extradata):
+        array_header = extradata[offset]
+        nal_type = array_header & 0x3F
+        offset += 1
+        num_nalus = struct.unpack(">H", extradata[offset:offset+2])[0]
+        offset += 2
+        for i in range(num_nalus):
+            nal_size = struct.unpack(">H", extradata[offset:offset+2])[0]
+            offset += 2
+            if nal_size != len(nal_units[j]):
+                raise ValueError
+            result[offset:offset+nal_size] = nal_units[j]
+            j += 1
+            offset += nal_size
+    return result
+
+def get_patched_hevc_config_nalus(file, optlist):
+    hevc_metadata=":".join(optlist)
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "0", "-to", "0.001", "-i", file, "-c:v", "copy", "-an", "-bsf:v", f"hevc_metadata={hevc_metadata},dump_extra",
+        "-f", "hevc", "pipe:1"],
+        stdout=subprocess.PIPE
+    )
+    out_nalu_data, _ = proc.communicate()
+    config_nalus = []
+    for nal in iter_nal_units_in_annexb(out_nalu_data):
+        type = nal[4]
+        if type in (0x40, 0x42, 0x44):
+            config_nalus.append(nal[4:])
+        else:
+            break
+    if len(config_nalus) < 3:
+        raise Exception("unexpected output from ffmpeg")
+    return config_nalus
+
+def patch_hvcC(dry_run, fp, trak_off, trak_size, config_nalus):
+    fp.seek(trak_off)
+    off, size = goto_hvcC(fp, trak_off, trak_off + trak_size)
+    if not off:
+        return
+    old_extra = fp.read(size)
+    original_config_nalus = list(extract_nal_units_from_hvcC(old_extra))
+    if len(original_config_nalus) != len(config_nalus):
+        raise Exception("count of extra NALUs has changed, unexptected")
+    changed = []
+    for i, (old, new) in enumerate(zip(original_config_nalus, config_nalus)):
+        if old != new:
+            if old[0] != 0x42 or new[0] != 0x42:
+                raise Exception("NAL unit other than SPS has changed, unexptected")
+            if len(old) != len(new):
+                raise Exception("SPS size has changed")
+            changed.append(i)
+    if len(changed) == 0:
+        print("SPS has not changed", file=sys.stderr)
+        return
+    new_extra = update_nal_units_in_hvcC(old_extra, config_nalus)
+    if len(new_extra) != size:
+        raise Exception("hvcC payload size has changed")
+    for x in changed:
+        print(f'''patch hvcC SPS:
+{original_config_nalus[x].hex()} ->
+{config_nalus[x].hex()}''', file=sys.stderr)
+    if dry_run:
+        return
+    fp.seek(-size, os.SEEK_CUR)
+    fp.write(new_extra)
+
+def patch_colr(dry_run, fp, trak_off, trak_size, new_primaries, new_transfer, new_matrix):
+    fp.seek(trak_off)
+    off, size = goto_colr(fp, trak_off, trak_off + trak_size)
+    if not off:
+        return
+    old = fp.read(size)
+    _, primaries, transfer, matrix, _ = struct.unpack('>4sHHHB', old)
+    changed = 0
+    if new_primaries:
+        if new_primaries != primaries:
+            changed += 1
+        primaries = new_primaries
+    if new_transfer:
+        if new_transfer != transfer:
+            changed += 1
+        transfer = new_transfer
+    if new_matrix:
+        if new_matrix != matrix:
+            changed += 1
+        matrix = new_matrix
+    if not changed:
+        print("colr has not changed", file=sys.stderr)
+        return
+    new = make_colr_box_payload(primaries, transfer, matrix)
+    print(f'''patch colr: 
+{old.hex()} -> 
+{new.hex()}''', file=sys.stderr)
+    if dry_run:
+        return
+    fp.seek(-size, os.SEEK_CUR)
+    fp.write(new)
+
+def main():
+    usage = """usage: rewrite-mp4-color OPTIONS FILE
+OPTIONS:
+    -p NUMBER  color primaries
+    -t NUMBER  transfer characteristics
+    -m NUMBER  matrix coefficients
+    --colr     patch colr box
+    --hvcC     patch hvcC
+    --dry-run  don't actually rewrite
+"""
+    opts, args = getopt.getopt(sys.argv[1:], "p:t:m:", ["colr", "hvcC", "dry-run"])
+    optlist = []
+    targets = set()
+    primaries = None
+    transfer = None
+    matrix = None
+    dry_run = False
+    for o, a in opts:
+        if o == '-p':
+            primaries = int(a)
+            optlist.append(f'colour_primaries={primaries}')
+        elif o == '-t':
+            transfer = int(a)
+            optlist.append(f'transfer_characteristics={transfer}')
+        elif o == '-m':
+            matrix = int(a)
+            optlist.append(f'matrix_coefficients={matrix}')
+        elif o == "--colr":
+            targets.add("colr")
+        elif o == "--hvcC":
+            targets.add("hvcC")
+        elif o == '--dry-run':
+            dry_run = True
+        else:
+            print(usage, file=sys.stderr)
+            return
+    
+    if len(optlist) == 0 or len(targets) == 0 or len(args) == 0:
+        print(usage, file=sys.stderr)
+        return
+    
+    if "hvcC" in targets:
+        config_nalus = get_patched_hevc_config_nalus(args[0], optlist)
+
+    with open(args[0], dry_run and 'rb' or 'rb+') as fp:
+        for track_off, track_size in track_offsets(fp):
+            if "hvcC" in targets:
+                patch_hvcC(dry_run, fp, track_off, track_size, config_nalus)
+            if "colr" in targets:
+                patch_colr(dry_run, fp, track_off, track_size, primaries, transfer, matrix)
+
+if __name__ == '__main__':
+    main()
