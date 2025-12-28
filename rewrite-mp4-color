@@ -16,7 +16,7 @@ def get_header(fp):
         x = fp.read(8)
         if not x or len(x) < 8:
             return None, None
-        size = struct.unpack('>8', x)[0]
+        size = struct.unpack('>Q', x)[0]
         header_size = 16
     return name, size - header_size
 
