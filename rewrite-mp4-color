@@ -59,29 +59,37 @@ def make_colr_box_payload(primaries, transfer, matrix):
     colr_data = struct.pack('>4sHHHB', colour_type, primaries, transfer, matrix, 0)
     return colr_data
 
-def goto_colr(fp, track_off, limit):
+VISUAL_SAMPLE_ENTRY_SIZE = 78
+
+def goto_sample_entry(fp, track_off, limit, types):
     fp.seek(track_off)
     off, size = goto_box(fp, limit, (b'mdia', b'minf', b'stbl', b'stsd'))
     if not off:
         return None, None
     fp.seek(8, os.SEEK_CUR) # skip inside stsd
-    off, size = goto_box(fp, off + size, (b'hvc1',))
+    end = off + size
+    while fp.tell() < end:
+        name, size = get_header(fp)
+        if name in types:
+            return fp.tell(), size
+        fp.seek(size, os.SEEK_CUR)
+    return None, None
+
+def goto_box_in_sample_entry(fp, track_off, limit, types, path):
+    off, size = goto_sample_entry(fp, track_off, limit, types)
     if not off:
         return None, None
-    fp.seek(78, os.SEEK_CUR) # skip inside hvc1
-    return goto_box(fp, off + size, (b'colr',))
+    fp.seek(VISUAL_SAMPLE_ENTRY_SIZE, os.SEEK_CUR)
+    return goto_box(fp, off + size, path)
+
+def goto_colr(fp, track_off, limit):
+    return goto_box_in_sample_entry(fp, track_off, limit, (b'hvc1', b'hev1', b'av01'), (b'colr',))
 
 def goto_hvcC(fp, track_off, limit):
-    fp.seek(track_off)
-    off, size = goto_box(fp, limit, (b'mdia', b'minf', b'stbl', b'stsd'))
-    if not off:
-        return None, None
-    fp.seek(8, os.SEEK_CUR) # skip inside stsd
-    off, size = goto_box(fp, off + size, (b'hvc1',))
-    if not off:
-        return None, None
-    fp.seek(78, os.SEEK_CUR) # skip inside hvc1
-    return goto_box(fp, off + size, (b'hvcC',))
+    return goto_box_in_sample_entry(fp, track_off, limit, (b'hvc1', b'hev1'), (b'hvcC',))
+
+def goto_av1C(fp, track_off, limit):
+    return goto_box_in_sample_entry(fp, track_off, limit, (b'av01',), (b'av1C',))
 
 def extract_nal_units_from_hvcC(extradata):
     offset = 23
@@ -169,6 +177,311 @@ def patch_hvcC(dry_run, fp, trak_off, trak_size, config_nalus):
     fp.seek(-size, os.SEEK_CUR)
     fp.write(new_extra)
 
+OBU_SEQUENCE_HEADER = 1
+OBU_TEMPORAL_DELIMITER = 2
+OBU_FRAME_HEADER = 3
+OBU_TILE_GROUP = 4
+OBU_FRAME = 6
+OBU_REDUNDANT_FRAME_HEADER = 7
+
+class BitReader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def f(self, n):
+        value = 0
+        for _ in range(n):
+            byte = self.data[self.pos >> 3]
+            value = (value << 1) | ((byte >> (7 - (self.pos & 7))) & 1)
+            self.pos += 1
+        return value
+
+    def uvlc(self):
+        leading_zeros = 0
+        while not self.f(1):
+            leading_zeros += 1
+        if leading_zeros >= 32:
+            return (1 << 32) - 1
+        return self.f(leading_zeros) + (1 << leading_zeros) - 1
+
+def write_bits(data, pos, n, value):
+    for i in range(n):
+        bit = (value >> (n - 1 - i)) & 1
+        mask = 1 << (7 - (pos & 7))
+        if bit:
+            data[pos >> 3] |= mask
+        else:
+            data[pos >> 3] &= ~mask
+        pos += 1
+
+def parse_av1_color_config(seqhdr):
+    """Parse AV1 sequence_header_obu() payload up to color_config().
+    Returns a dict with bit position of color_primaries and related values."""
+    r = BitReader(seqhdr)
+    seq_profile = r.f(3)
+    r.f(1) # still_picture
+    reduced_still_picture_header = r.f(1)
+    if reduced_still_picture_header:
+        r.f(5) # seq_level_idx[0]
+    else:
+        decoder_model_info_present_flag = 0
+        buffer_delay_length_minus_1 = 0
+        if r.f(1): # timing_info_present_flag
+            r.f(32) # num_units_in_display_tick
+            r.f(32) # time_scale
+            if r.f(1): # equal_picture_interval
+                r.uvlc() # num_ticks_per_picture_minus_1
+            decoder_model_info_present_flag = r.f(1)
+            if decoder_model_info_present_flag:
+                buffer_delay_length_minus_1 = r.f(5)
+                r.f(32) # num_units_in_decoding_tick
+                r.f(5) # buffer_removal_time_length_minus_1
+                r.f(5) # frame_presentation_time_length_minus_1
+        initial_display_delay_present_flag = r.f(1)
+        operating_points_cnt_minus_1 = r.f(5)
+        for _ in range(operating_points_cnt_minus_1 + 1):
+            r.f(12) # operating_point_idc
+            seq_level_idx = r.f(5)
+            if seq_level_idx > 7:
+                r.f(1) # seq_tier
+            if decoder_model_info_present_flag:
+                if r.f(1): # decoder_model_present_for_this_op
+                    n = buffer_delay_length_minus_1 + 1
+                    r.f(n) # decoder_buffer_delay
+                    r.f(n) # encoder_buffer_delay
+                    r.f(1) # low_delay_mode_flag
+            if initial_display_delay_present_flag:
+                if r.f(1): # initial_display_delay_present_for_this_op
+                    r.f(4) # initial_display_delay_minus_1
+    frame_width_bits_minus_1 = r.f(4)
+    frame_height_bits_minus_1 = r.f(4)
+    r.f(frame_width_bits_minus_1 + 1) # max_frame_width_minus_1
+    r.f(frame_height_bits_minus_1 + 1) # max_frame_height_minus_1
+    frame_id_numbers_present_flag = 0 if reduced_still_picture_header else r.f(1)
+    if frame_id_numbers_present_flag:
+        r.f(4) # delta_frame_id_length_minus_2
+        r.f(3) # additional_frame_id_length_minus_1
+    r.f(1) # use_128x128_superblock
+    r.f(1) # enable_filter_intra
+    r.f(1) # enable_intra_edge_filter
+    if not reduced_still_picture_header:
+        r.f(1) # enable_interintra_compound
+        r.f(1) # enable_masked_compound
+        r.f(1) # enable_warped_motion
+        r.f(1) # enable_dual_filter
+        enable_order_hint = r.f(1)
+        if enable_order_hint:
+            r.f(1) # enable_jnt_comp
+            r.f(1) # enable_ref_frame_mvs
+        if r.f(1): # seq_choose_screen_content_tools
+            seq_force_screen_content_tools = 2 # SELECT_SCREEN_CONTENT_TOOLS
+        else:
+            seq_force_screen_content_tools = r.f(1)
+        if seq_force_screen_content_tools > 0:
+            if not r.f(1): # seq_choose_integer_mv
+                r.f(1) # seq_force_integer_mv
+        if enable_order_hint:
+            r.f(3) # order_hint_bits_minus_1
+    r.f(1) # enable_superres
+    r.f(1) # enable_cdef
+    r.f(1) # enable_restoration
+    # color_config()
+    high_bitdepth = r.f(1)
+    twelve_bit = 0
+    if seq_profile == 2 and high_bitdepth:
+        twelve_bit = r.f(1)
+    mono_chrome = 0 if seq_profile == 1 else r.f(1)
+    if not r.f(1): # color_description_present_flag
+        return None
+    pos = r.pos
+    primaries, transfer, matrix = r.f(8), r.f(8), r.f(8)
+    subsampling_x = subsampling_y = 1
+    if not mono_chrome and (primaries, transfer, matrix) != (1, 13, 0):
+        r.f(1) # color_range
+        if seq_profile == 0:
+            pass
+        elif seq_profile == 1:
+            subsampling_x = subsampling_y = 0
+        elif twelve_bit:
+            subsampling_x = r.f(1)
+            subsampling_y = r.f(1) if subsampling_x else 0
+        else:
+            subsampling_y = 0
+    elif not mono_chrome:
+        subsampling_x = subsampling_y = 0
+    return {
+        'pos': pos,
+        'values': (primaries, transfer, matrix),
+        'mono_chrome': mono_chrome,
+        'subsampling': (subsampling_x, subsampling_y),
+    }
+
+def patch_av1_sequence_header(seqhdr, new_primaries, new_transfer, new_matrix):
+    cc = parse_av1_color_config(seqhdr)
+    if not cc:
+        raise Exception("AV1 sequence header has no color description, cannot patch")
+    old_values = cc['values']
+    new_values = tuple(o if n is None else n for o, n in
+                       zip(old_values, (new_primaries, new_transfer, new_matrix)))
+    if old_values == new_values:
+        return seqhdr
+    srgb = (1, 13, 0) # BT.709 / sRGB / Identity
+    if not cc['mono_chrome'] and (old_values == srgb) != (new_values == srgb):
+        raise Exception(f"cannot rewrite AV1 color description {old_values} -> {new_values} "
+                        "in-place: sRGB/Identity (1, 13, 0) changes the sequence header syntax")
+    if not cc['mono_chrome'] and new_values[2] == 0 and cc['subsampling'] != (0, 0):
+        raise Exception("matrix_coefficients 0 (Identity) requires 4:4:4 in AV1")
+    result = bytearray(seqhdr)
+    for i, value in enumerate(new_values):
+        write_bits(result, cc['pos'] + i * 8, 8, value)
+    return bytes(result)
+
+def read_leb128(buf, pos):
+    value = 0
+    for i in range(8):
+        b = buf[pos + i]
+        value |= (b & 0x7F) << (i * 7)
+        if not b & 0x80:
+            return value, pos + i + 1
+    raise ValueError("invalid leb128")
+
+def iter_obus(buf):
+    """yield (obu_type, payload_start, payload_end) for each OBU in buf.
+    payload_end may exceed len(buf) when buf is truncated."""
+    pos = 0
+    while pos < len(buf):
+        header = buf[pos]
+        obu_type = (header >> 3) & 0xF
+        extension_flag = (header >> 2) & 1
+        has_size_field = (header >> 1) & 1
+        pos += 1 + extension_flag
+        if has_size_field:
+            size, pos = read_leb128(buf, pos)
+        else:
+            size = len(buf) - pos
+        yield obu_type, pos, pos + size
+        pos += size
+
+def read_sample_table(fp, trak_off, trak_size):
+    fp.seek(trak_off)
+    off, size = goto_box(fp, trak_off + trak_size, (b'mdia', b'minf', b'stbl'))
+    if not off:
+        return []
+    boxes = {}
+    while fp.tell() < off + size:
+        name, box_size = get_header(fp)
+        if name in (b'stsz', b'stz2', b'stsc', b'stco', b'co64'):
+            boxes[name] = fp.read(box_size)
+        else:
+            fp.seek(box_size, os.SEEK_CUR)
+
+    if b'stsz' in boxes:
+        data = boxes[b'stsz']
+        sample_size, sample_count = struct.unpack('>II', data[4:12])
+        if sample_size:
+            sizes = [sample_size] * sample_count
+        else:
+            sizes = struct.unpack(f'>{sample_count}I', data[12:12+4*sample_count])
+    elif b'stz2' in boxes:
+        data = boxes[b'stz2']
+        field_size = data[7]
+        sample_count = struct.unpack('>I', data[8:12])[0]
+        if field_size == 4:
+            sizes = []
+            for i in range(sample_count):
+                b = data[12 + i // 2]
+                sizes.append(b & 0xF if i & 1 else b >> 4)
+        else:
+            fmt = {8: 'B', 16: 'H'}[field_size]
+            sizes = struct.unpack(f'>{sample_count}{fmt}', data[12:12+field_size//8*sample_count])
+    else:
+        raise Exception("sample size box not found")
+
+    if b'stco' in boxes:
+        data = boxes[b'stco']
+        count = struct.unpack('>I', data[4:8])[0]
+        chunk_offsets = struct.unpack(f'>{count}I', data[8:8+4*count])
+    elif b'co64' in boxes:
+        data = boxes[b'co64']
+        count = struct.unpack('>I', data[4:8])[0]
+        chunk_offsets = struct.unpack(f'>{count}Q', data[8:8+8*count])
+    else:
+        raise Exception("chunk offset box not found")
+
+    data = boxes[b'stsc']
+    count = struct.unpack('>I', data[4:8])[0]
+    stsc = [struct.unpack('>III', data[8+12*i:20+12*i]) for i in range(count)]
+
+    samples = []
+    for i, (first_chunk, samples_per_chunk, _) in enumerate(stsc):
+        last_chunk = stsc[i + 1][0] - 1 if i + 1 < len(stsc) else len(chunk_offsets)
+        for chunk in range(first_chunk, last_chunk + 1):
+            off = chunk_offsets[chunk - 1]
+            for _ in range(samples_per_chunk):
+                if len(samples) >= len(sizes):
+                    return samples
+                size = sizes[len(samples)]
+                samples.append((off, size))
+                off += size
+    return samples
+
+def iter_av1_sequence_headers_in_samples(fp, samples):
+    """yield (file offset, payload) of each sequence header OBU stored in samples"""
+    for off, size in samples:
+        fp.seek(off)
+        buf = fp.read(min(size, 1024))
+        for obu_type, start, end in iter_obus(buf):
+            if obu_type in (OBU_FRAME_HEADER, OBU_TILE_GROUP, OBU_FRAME, OBU_REDUNDANT_FRAME_HEADER):
+                break
+            if obu_type != OBU_SEQUENCE_HEADER:
+                continue
+            if end > len(buf):
+                fp.seek(off)
+                buf = fp.read(size)
+            yield off + start, buf[start:end]
+
+def patch_av1C(dry_run, fp, trak_off, trak_size, new_primaries, new_transfer, new_matrix):
+    off, size = goto_av1C(fp, trak_off, trak_off + trak_size)
+    if not off:
+        return
+    patches = []
+    av1C = fp.read(size)
+    for obu_type, start, end in iter_obus(av1C[4:]):
+        if obu_type == OBU_SEQUENCE_HEADER:
+            old = av1C[4+start:4+end]
+            new = patch_av1_sequence_header(old, new_primaries, new_transfer, new_matrix)
+            if old != new:
+                patches.append((off + 4 + start, old, new))
+                print(f'''patch av1C sequence header:
+{old.hex()} ->
+{new.hex()}''', file=sys.stderr)
+
+    samples = read_sample_table(fp, trak_off, trak_size)
+    inband = 0
+    shown = set()
+    for pos, old in iter_av1_sequence_headers_in_samples(fp, samples):
+        new = patch_av1_sequence_header(old, new_primaries, new_transfer, new_matrix)
+        if old == new:
+            continue
+        patches.append((pos, old, new))
+        inband += 1
+        if old not in shown:
+            shown.add(old)
+            print(f'''patch in-band sequence header:
+{old.hex()} ->
+{new.hex()}''', file=sys.stderr)
+    if inband:
+        print(f"{inband} in-band sequence header(s) to patch", file=sys.stderr)
+    if not patches:
+        print("AV1 sequence header has not changed", file=sys.stderr)
+        return
+    if dry_run:
+        return
+    for pos, _, new in patches:
+        fp.seek(pos)
+        fp.write(new)
+
 def patch_colr(dry_run, fp, trak_off, trak_size, new_primaries, new_transfer, new_matrix):
     fp.seek(trak_off)
     off, size = goto_colr(fp, trak_off, trak_off + trak_size)
@@ -209,9 +522,10 @@ OPTIONS:
     -m NUMBER  matrix coefficients
     --colr     patch colr box
     --hvcC     patch hvcC
+    --av1C     patch av1C and in-band AV1 sequence headers
     --dry-run  don't actually rewrite
 """
-    opts, args = getopt.getopt(sys.argv[1:], "p:t:m:", ["colr", "hvcC", "dry-run"])
+    opts, args = getopt.getopt(sys.argv[1:], "p:t:m:", ["colr", "hvcC", "av1C", "dry-run"])
     optlist = []
     targets = set()
     primaries = None
@@ -232,6 +546,8 @@ OPTIONS:
             targets.add("colr")
         elif o == "--hvcC":
             targets.add("hvcC")
+        elif o == "--av1C":
+            targets.add("av1C")
         elif o == '--dry-run':
             dry_run = True
         else:
@@ -249,6 +565,8 @@ OPTIONS:
         for track_off, track_size in track_offsets(fp):
             if "hvcC" in targets:
                 patch_hvcC(dry_run, fp, track_off, track_size, config_nalus)
+            if "av1C" in targets:
+                patch_av1C(dry_run, fp, track_off, track_size, primaries, transfer, matrix)
             if "colr" in targets:
                 patch_colr(dry_run, fp, track_off, track_size, primaries, transfer, matrix)
 

@@ -1,8 +1,8 @@
 # rewrite-mp4-color
 
-A tool for patching and rewriting color information—specifically color primaries, transfer characteristics, and matrix coefficients—for HEVC video streams inside MP4 containers.
+A tool for patching and rewriting color information—specifically color primaries, transfer characteristics, and matrix coefficients—for HEVC and AV1 video streams inside MP4 containers.
 
-It directly rewrites a few bytes in either or both the colr and hvcC boxes of the MP4 container, making it significantly faster than using the hevc_metadata bitstream filter in ffmpeg. The process completes almost instantly.
+It directly rewrites a few bytes in the colr and hvcC boxes of the MP4 container (for AV1, the av1C box and the sequence header OBUs in the samples), making it significantly faster than using the hevc_metadata/av1_metadata bitstream filters in ffmpeg. The process completes almost instantly.
 
 However, this tool has several limitations not present in ffmpeg's hevc_metadata:
 
@@ -13,7 +13,13 @@ However, this tool has several limitations not present in ffmpeg's hevc_metadata
 - The tool can only update color information if it is already present in the SPS within the hvcC box; it cannot add new fields if missing.
 - It does not update SPS NAL units that are stored as part of the actual video bitstream (i.e., in-band samples), only those embedded in hvcC.
 
-This script requires ffmpeg to be installed and accessible from your system path.
+### AV1
+
+- With --av1C, the sequence header OBU in av1C and every in-band sequence header OBU stored in the samples are rewritten (in AV1, each key frame carries a sequence header, and decoders usually use those).
+- The sequence header must already contain color description (color_description_present_flag); it cannot be added.
+- Rewriting to or from (1, 13, 0) (BT.709/sRGB/Identity) changes the syntax of the rest of the sequence header, so it cannot be done in-place and is rejected.
+
+--hvcC requires ffmpeg to be installed and accessible from your system path. --av1C and --colr do not need ffmpeg.
 
 ## Usage
 
@@ -25,10 +31,11 @@ OPTIONS:
     -m NUMBER  matrix coefficients
     --colr     patch the colr box
     --hvcC     patch the hvcC box
+    --av1C     patch the av1C box and in-band AV1 sequence headers
     --dry-run  show what would be rewritten, without modifying the file
 ```
 
-You must specify at least one of -p, -t, or -m, as well as at least one of --colr or --hvcC. Fields that are not explicitly specified will not be modified—their original values will be preserved.
+You must specify at least one of -p, -t, or -m, as well as at least one of --colr, --hvcC or --av1C. Fields that are not explicitly specified will not be modified—their original values will be preserved.
 
 ## Example
 
